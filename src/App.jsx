@@ -2037,6 +2037,19 @@ function StudyMode({ domain, phase, setView, updateProgress, progress, toggleBoo
       setExplanation('Add your Claude API key via the gear icon on the home screen to use Learn More.');
       return;
     }
+
+    // Check cache first
+    try {
+      const cached = await storage.get('cscs-explanations');
+      if (cached?.value) {
+        const map = JSON.parse(cached.value);
+        if (map[cardId]) {
+          setExplanation(map[cardId]);
+          return;
+        }
+      }
+    } catch {}
+
     setLoadingExplain(true);
     setExplanation('');
     try {
@@ -2058,7 +2071,16 @@ function StudyMode({ domain, phase, setView, updateProgress, progress, toggleBoo
         }
       });
       const data = typeof response.data === 'string' ? JSON.parse(response.data) : response.data;
-      setExplanation(data?.content?.[0]?.text || 'No explanation returned.');
+      const text = data?.content?.[0]?.text || 'No explanation returned.';
+      setExplanation(text);
+
+      // Save to cache
+      try {
+        const cached = await storage.get('cscs-explanations');
+        const map = cached?.value ? JSON.parse(cached.value) : {};
+        map[cardId] = text;
+        await storage.set('cscs-explanations', JSON.stringify(map));
+      } catch {}
     } catch {
       setExplanation('Request failed. Check your API key in Home → Settings (gear icon).');
     } finally {
@@ -2128,8 +2150,8 @@ function StudyMode({ domain, phase, setView, updateProgress, progress, toggleBoo
         })}
       </div>
 
-      <div className="flex-1 flex items-center mb-8" style={{ perspective: '1500px', minHeight: '320px' }}>
-        <div onClick={() => setFlipped(!flipped)} className={`card-flip relative w-full cursor-pointer ${flipped ? 'flipped' : ''}`} style={{ minHeight: '320px' }}>
+      <div className="flex-1 flex items-center mb-8" style={{ perspective: '1500px', minHeight: '380px' }}>
+        <div onClick={() => setFlipped(!flipped)} className={`card-flip relative w-full cursor-pointer ${flipped ? 'flipped' : ''}`} style={{ minHeight: '380px' }}>
           <div className="card-face absolute inset-0 bg-stone-900 border-2 rounded-lg p-8 flex flex-col" style={{ borderColor: domain.phaseColor + '44' }}>
             <div className="flex items-center justify-between mb-6">
               <div className="font-mono text-xs uppercase tracking-widest" style={{ color: domain.phaseColor }}>Question</div>
@@ -2146,13 +2168,13 @@ function StudyMode({ domain, phase, setView, updateProgress, progress, toggleBoo
               </div>
             )}
           </div>
-          <div className="card-back card-face absolute inset-0 bg-stone-50 text-stone-900 rounded-lg p-8 flex flex-col">
-            <div className="flex items-center justify-between mb-6">
+          <div className="card-back card-face absolute inset-0 bg-stone-50 text-stone-900 rounded-lg p-6 flex flex-col">
+            <div className="flex items-center justify-between mb-4">
               <div className="font-mono text-xs uppercase tracking-widest text-stone-500">Answer</div>
               <div className="font-mono text-xs text-stone-400">TAP TO FLIP BACK</div>
             </div>
-            <div className="flex-1 flex items-center overflow-y-auto scrollbar-thin">
-              <p className="text-base md:text-lg leading-relaxed">{card.a}</p>
+            <div className="flex-1 overflow-y-auto scrollbar-thin">
+              <p className="text-sm md:text-base leading-relaxed">{card.a}</p>
             </div>
           </div>
         </div>

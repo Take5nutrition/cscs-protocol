@@ -1745,7 +1745,7 @@ export default function App() {
       `}</style>
 
       {view === 'home' && <Home setView={setView} setSelectedPhase={setSelectedPhase} progress={progress} allCards={allCards} resetProgress={resetProgress} setQuizConfig={setQuizConfig} apiKey={apiKey} saveApiKey={saveApiKey} updateProgress={updateProgress} logQuizResult={logQuizResult} />}
-      {view === 'exam' && <ExamSimulatorMode allCards={allCards} setView={setView} updateProgress={updateProgress} logQuizResult={logQuizResult} progress={progress} />}
+      {view === 'exam' && <ExamSimulatorMode allCards={allCards} setView={setView} updateProgress={updateProgress} logQuizResult={logQuizResult} progress={progress} apiKey={apiKey} />}
       {view === 'phase' && selectedPhase && <PhaseView phase={selectedPhase} setView={setView} setSelectedDomain={setSelectedDomain} progress={progress} />}
       {view === 'study' && selectedDomain && <StudyMode domain={selectedDomain} phase={selectedPhase} setView={setView} updateProgress={updateProgress} progress={progress} toggleBookmark={toggleBookmark} apiKey={apiKey} />}
       {view === 'quiz' && quizConfig && <QuizMode allCards={allCards} setView={setView} updateProgress={updateProgress} config={quizConfig} logQuizResult={logQuizResult} />}
@@ -2253,7 +2253,7 @@ function StudyMode({ domain, phase, setView, updateProgress, progress, toggleBoo
           onTouchEnd={handleTouchEnd}
           onClick={handleCardClick}
           className={`card-flip relative w-full cursor-pointer ${flipped ? 'flipped' : ''}`}
-          style={{ minHeight: '380px', transform: `translateX(${dragX * 0.15}px) rotate(${dragX * 0.02}deg)`, transition: dragging ? 'none' : undefined }}
+          style={{ minHeight: '380px', transform: `translateX(${dragX * 0.15}px) rotate(${dragX * 0.02}deg)`, transition: dragX !== 0 ? 'none' : undefined }}
         >
           <div className="card-face absolute inset-0 bg-stone-900 border-2 rounded-lg p-8 flex flex-col" style={{ borderColor: domain.phaseColor + '44' }}>
             <div className="flex items-center justify-between mb-6">
@@ -2334,90 +2334,138 @@ function StudyMode({ domain, phase, setView, updateProgress, progress, toggleBoo
 // EXAM SIMULATOR
 // ============================================================
 
-function makeChoices(card, allCards) {
+function fallbackChoices(card, allCards) {
   const distractors = allCards
     .filter(c => c.cardId !== card.cardId)
     .sort(() => Math.random() - 0.5)
     .slice(0, 3)
     .map(c => c.a);
-  const choices = [
-    { text: card.a, correct: true },
-    ...distractors.map(t => ({ text: t, correct: false })),
-  ].sort(() => Math.random() - 0.5);
-  return choices;
+  return [{ text: card.a, correct: true }, ...distractors.map(t => ({ text: t, correct: false }))].sort(() => Math.random() - 0.5);
 }
 
-function ExamSimulatorMode({ allCards, setView, updateProgress, logQuizResult, progress }) {
+async function fetchAIChoices(card, apiKey) {
+  const resp = await CapacitorHttp.request({
+    method: 'POST',
+    url: 'https://api.anthropic.com/v1/messages',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+    data: {
+      model: 'claude-haiku-4-5',
+      max_tokens: 400,
+      messages: [{
+        role: 'user',
+        content: `You are writing wrong answer choices for a CSCS certification exam question. Make them plausible — a student who half-knows the material should struggle to eliminate them.
+
+Question: ${card.q}
+Correct answer: ${card.a}
+
+Write exactly 3 wrong answer choices. Rules:
+- Similar length and specificity to the correct answer
+- Use real S&C terminology and plausible numbers
+- Each tests a different common misconception
+- Do NOT include the correct answer or reword it
+
+Return ONLY a JSON array of 3 strings, no explanation, no markdown:
+["wrong 1","wrong 2","wrong 3"]`
+      }]
+    }
+  });
+  const data = typeof resp.data === 'string' ? JSON.parse(resp.data) : resp.data;
+  const text = data?.content?.[0]?.text?.trim() || '[]';
+  const match = text.match(/\[[\s\S]*\]/);
+  if (!match) throw new Error('bad format');
+  const wrongs = JSON.parse(match[0]);
+  if (!Array.isArray(wrongs) || wrongs.length < 3) throw new Error('not enough choices');
+  return [{ text: card.a, correct: true }, ...wrongs.slice(0, 3).map(t => ({ text: t, correct: false }))].sort(() => Math.random() - 0.5);
+}
+
+function ExamSimulatorMode({ allCards, setView, updateProgress, logQuizResult, progress, apiKey }) {
   const [stage, setStage] = useState('config');
   const [section, setSection] = useState('all');
   const [questionCount, setQuestionCount] = useState(20);
   const [pool, setPool] = useState([]);
   const [choices, setChoices] = useState([]);
+  const [loadingChoices, setLoadingChoices] = useState(false);
   const [idx, setIdx] = useState(0);
-  const [selected, setSelected] = useState(null); // index of chosen answer
+  const [selected, setSelected] = useState(null);
   const [timeLeft, setTimeLeft] = useState(null);
   const [results, setResults] = useState([]);
   const timerRef = useRef(null);
 
   const TIME_PER_Q = section === 'sci' ? 57 : 72;
 
+  const loadChoices = async (card) => {
+    setLoadingChoices(true);
+    setChoices([]);
+    try {
+      if (apiKey) {
+        const c = await fetchAIChoices(card, apiKey);
+        setChoices(c);
+      } else {
+        setChoices(fallbackChoices(card, allCards));
+      }
+    } catch {
+      setChoices(fallbackChoices(card, allCards));
+    } finally {
+      setLoadingChoices(false);
+    }
+  };
+
   useEffect(() => {
-    if (stage !== 'exam' || timeLeft === null || selected !== null) return;
-    if (timeLeft <= 0) { commitAnswer(-1); return; }
+    if (stage !== 'exam' || timeLeft === null || selected !== null || loadingChoices) return;
+    if (timeLeft <= 0) { handleTimeout(); return; }
     timerRef.current = setTimeout(() => setTimeLeft(t => t - 1), 1000);
     return () => clearTimeout(timerRef.current);
-  }, [timeLeft, stage, selected]);
+  }, [timeLeft, stage, selected, loadingChoices]);
 
-  const startExam = () => {
+  const startExam = async () => {
     let cards = [...allCards];
     if (section === 'sci') cards = cards.filter(c => SRS_SECTION_PHASES.sci.includes(c.phaseId));
     if (section === 'practical') cards = cards.filter(c => SRS_SECTION_PHASES.practical.includes(c.phaseId));
     const shuffled = cards.sort(() => Math.random() - 0.5).slice(0, questionCount);
     setPool(shuffled);
-    setChoices(makeChoices(shuffled[0], allCards));
     setIdx(0);
     setResults([]);
     setSelected(null);
     setTimeLeft(TIME_PER_Q);
     setStage('exam');
+    await loadChoices(shuffled[0]);
+  };
+
+  const handleTimeout = () => {
+    clearTimeout(timerRef.current);
+    const card = pool[idx];
+    const newResults = [...results, { card, correct: false, chosen: '(timed out)' }];
+    setResults(newResults);
+    updateProgress(card.cardId, 'struggled', srsNextReview(progress.srs?.[card.cardId], false));
+    if (idx + 1 >= pool.length) {
+      logQuizResult({ mode: 'exam-sim', total: pool.length, correct: newResults.filter(r => r.correct).length });
+      setStage('results');
+    } else {
+      setSelected(-1); // show timed-out state
+    }
   };
 
   const pickAnswer = (i) => {
-    if (selected !== null) return;
+    if (selected !== null || loadingChoices) return;
     clearTimeout(timerRef.current);
     setSelected(i);
     const correct = choices[i].correct;
     const card = pool[idx];
     const newResults = [...results, { card, correct, chosen: choices[i].text }];
     setResults(newResults);
-    const srsData = srsNextReview(progress.srs?.[card.cardId], correct);
-    updateProgress(card.cardId, correct ? 'known' : 'struggled', srsData);
+    updateProgress(card.cardId, correct ? 'known' : 'struggled', srsNextReview(progress.srs?.[card.cardId], correct));
     if (idx + 1 >= pool.length) {
       logQuizResult({ mode: 'exam-sim', total: pool.length, correct: newResults.filter(r => r.correct).length });
     }
   };
 
-  const commitAnswer = (i) => {
-    clearTimeout(timerRef.current);
-    const correct = i >= 0 ? choices[i].correct : false;
-    const card = pool[idx];
-    const newResults = [...results, { card, correct, chosen: i >= 0 ? choices[i].text : '(timed out)' }];
-    setResults(newResults);
-    const srsData = srsNextReview(progress.srs?.[card.cardId], correct);
-    updateProgress(card.cardId, correct ? 'known' : 'struggled', srsData);
-    if (idx + 1 >= pool.length) {
-      logQuizResult({ mode: 'exam-sim', total: pool.length, correct: newResults.filter(r => r.correct).length });
-      setStage('results');
-    }
-  };
-
-  const nextQuestion = () => {
+  const nextQuestion = async () => {
     if (idx + 1 >= pool.length) { setStage('results'); return; }
     const nextIdx = idx + 1;
     setIdx(nextIdx);
-    setChoices(makeChoices(pool[nextIdx], allCards));
     setSelected(null);
     setTimeLeft(TIME_PER_Q);
+    await loadChoices(pool[nextIdx]);
   };
 
   if (stage === 'config') {
@@ -2509,22 +2557,28 @@ function ExamSimulatorMode({ allCards, setView, updateProgress, logQuizResult, p
       </div>
 
       <div className="space-y-2 flex-1">
-        {choices.map((choice, i) => {
-          let bg = 'bg-stone-900 border-stone-800';
+        {loadingChoices ? (
+          <div className="flex flex-col items-center justify-center py-12 text-stone-500">
+            <div className="font-mono text-xs uppercase tracking-widest mb-2">Generating choices...</div>
+            <div className="w-6 h-6 border-2 border-stone-700 border-t-stone-400 rounded-full animate-spin" />
+          </div>
+        ) : choices.map((choice, i) => {
+          let borderCls = 'border-stone-800';
           let textColor = 'text-stone-200';
+          let bgCls = 'bg-stone-900';
           if (selected !== null) {
-            if (choice.correct) { bg = 'border-green-500'; textColor = 'text-green-400'; }
-            else if (i === selected && !choice.correct) { bg = 'border-red-500'; textColor = 'text-red-400'; }
-            else { bg = 'bg-stone-900 border-stone-800'; textColor = 'text-stone-600'; }
+            if (choice.correct) { borderCls = 'border-green-500'; textColor = 'text-green-300'; bgCls = 'bg-green-950'; }
+            else if (i === selected) { borderCls = 'border-red-500'; textColor = 'text-red-400'; bgCls = 'bg-red-950'; }
+            else { textColor = 'text-stone-600'; }
           }
           return (
             <button
               key={i}
               onClick={() => pickAnswer(i)}
-              disabled={selected !== null}
-              className={`w-full border rounded-lg p-4 text-left transition-all ${bg} ${textColor}`}
+              disabled={selected !== null || loadingChoices}
+              className={`w-full border rounded-lg p-4 text-left transition-all ${bgCls} ${borderCls} ${textColor}`}
             >
-              <span className="font-mono text-xs mr-2 opacity-60">{String.fromCharCode(65 + i)}.</span>
+              <span className="font-mono text-xs mr-2 opacity-50">{String.fromCharCode(65 + i)}.</span>
               <span className="text-sm leading-relaxed">{choice.text}</span>
             </button>
           );

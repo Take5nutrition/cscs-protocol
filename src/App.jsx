@@ -1660,7 +1660,7 @@ export default function App() {
   const [selectedPhase, setSelectedPhase] = useState(null);
   const [selectedDomain, setSelectedDomain] = useState(null);
   const [quizConfig, setQuizConfig] = useState(null);
-  const [progress, setProgress] = useState({ known: {}, struggled: {}, seen: {}, bookmarked: {}, streak: 0, lastStudy: null, totalReviews: 0, quizHistory: [] });
+  const [progress, setProgress] = useState({ known: {}, struggled: {}, seen: {}, bookmarked: {}, srs: {}, streak: 0, lastStudy: null, totalReviews: 0, quizHistory: [] });
   const [apiKey, setApiKeyState] = useState('');
 
   useEffect(() => {
@@ -1687,11 +1687,12 @@ export default function App() {
 
   const allCards = useMemo(() => getAllCards(), []);
 
-  const updateProgress = (cardId, status) => {
+  const updateProgress = (cardId, status, srsData) => {
     setProgress(p => {
       const next = { ...p, seen: { ...p.seen, [cardId]: true }, totalReviews: p.totalReviews + 1, lastStudy: new Date().toISOString() };
       if (status === 'known') next.known = { ...p.known, [cardId]: (p.known[cardId] || 0) + 1 };
       else if (status === 'struggled') next.struggled = { ...p.struggled, [cardId]: (p.struggled[cardId] || 0) + 1 };
+      if (srsData) next.srs = { ...(p.srs || {}), [cardId]: srsData };
       return next;
     });
   };
@@ -1711,7 +1712,7 @@ export default function App() {
 
   const resetProgress = () => {
     if (confirm('Reset all progress? This cannot be undone.')) {
-      setProgress({ known: {}, struggled: {}, seen: {}, bookmarked: {}, streak: 0, lastStudy: null, totalReviews: 0, quizHistory: [] });
+      setProgress({ known: {}, struggled: {}, seen: {}, bookmarked: {}, srs: {}, streak: 0, lastStudy: null, totalReviews: 0, quizHistory: [] });
     }
   };
 
@@ -1743,7 +1744,8 @@ export default function App() {
         button:active { opacity: 0.8; }
       `}</style>
 
-      {view === 'home' && <Home setView={setView} setSelectedPhase={setSelectedPhase} progress={progress} allCards={allCards} resetProgress={resetProgress} setQuizConfig={setQuizConfig} apiKey={apiKey} saveApiKey={saveApiKey} />}
+      {view === 'home' && <Home setView={setView} setSelectedPhase={setSelectedPhase} progress={progress} allCards={allCards} resetProgress={resetProgress} setQuizConfig={setQuizConfig} apiKey={apiKey} saveApiKey={saveApiKey} updateProgress={updateProgress} logQuizResult={logQuizResult} />}
+      {view === 'exam' && <ExamSimulatorMode allCards={allCards} setView={setView} updateProgress={updateProgress} logQuizResult={logQuizResult} progress={progress} />}
       {view === 'phase' && selectedPhase && <PhaseView phase={selectedPhase} setView={setView} setSelectedDomain={setSelectedDomain} progress={progress} />}
       {view === 'study' && selectedDomain && <StudyMode domain={selectedDomain} phase={selectedPhase} setView={setView} updateProgress={updateProgress} progress={progress} toggleBookmark={toggleBookmark} apiKey={apiKey} />}
       {view === 'quiz' && quizConfig && <QuizMode allCards={allCards} setView={setView} updateProgress={updateProgress} config={quizConfig} logQuizResult={logQuizResult} />}
@@ -1759,7 +1761,7 @@ export default function App() {
 // HOME
 // ============================================================
 
-function Home({ setView, setSelectedPhase, progress, allCards, resetProgress, setQuizConfig, apiKey, saveApiKey }) {
+function Home({ setView, setSelectedPhase, progress, allCards, resetProgress, setQuizConfig, apiKey, saveApiKey, updateProgress, logQuizResult }) {
   const totalCards = allCards.length;
   const seenCount = Object.keys(progress.seen).length;
   const knownCount = Object.keys(progress.known).length;
@@ -1847,6 +1849,14 @@ function Home({ setView, setSelectedPhase, progress, allCards, resetProgress, se
             <div className="font-display text-2xl text-stone-50">EXAM INTEL</div>
           </div>
           <ChevronRight className="w-5 h-5 text-stone-500 group-hover:translate-x-1 transition-transform" />
+        </button>
+
+        <button onClick={() => setView('exam')} className="group col-span-2 md:col-span-1 p-5 rounded text-left flex items-center justify-between transition-all" style={{ background: 'linear-gradient(135deg, #1B4332 0%, #081C15 100%)', border: '1px solid #2D6A4F44' }}>
+          <div>
+            <div className="font-mono text-xs uppercase tracking-widest mb-1" style={{ color: '#52B788' }}>Timed Practice</div>
+            <div className="font-display text-2xl text-stone-50">EXAM SIM</div>
+          </div>
+          <Clock className="w-5 h-5 group-hover:scale-110 transition-transform" style={{ color: '#52B788' }} />
         </button>
       </div>
 
@@ -2004,14 +2014,47 @@ function PhaseView({ phase, setView, setSelectedDomain, progress }) {
 // STUDY MODE
 // ============================================================
 
+const SRS_SECTION_PHASES = {
+  sci: ['phase1','phase2','phase3','phase7','phase8','phase11','phase12','phase13'],
+  practical: ['phase4','phase5','phase6','phase9','phase10','phase14','phase15','phase16','phase17','phase18','phase19','phase20','phase21'],
+};
+
+function srsNextReview(prevSRS, correct) {
+  const now = Date.now();
+  if (!correct) {
+    return { interval: 1, streak: 0, nextReview: new Date(now + 24 * 60 * 60 * 1000).toISOString() };
+  }
+  const streak = (prevSRS?.streak || 0) + 1;
+  const prevInterval = prevSRS?.interval || 1;
+  const interval = streak === 1 ? 1 : streak === 2 ? 3 : Math.min(Math.round(prevInterval * 2.5), 60);
+  return { interval, streak, nextReview: new Date(now + interval * 24 * 60 * 60 * 1000).toISOString() };
+}
+
 function StudyMode({ domain, phase, setView, updateProgress, progress, toggleBookmark, apiKey }) {
   const [idx, setIdx] = useState(0);
   const [flipped, setFlipped] = useState(false);
   const [shuffled, setShuffled] = useState(false);
-  const [order, setOrder] = useState(domain.cards.map((_, i) => i));
+  const [order, setOrder] = useState(() => {
+    const now = new Date();
+    return domain.cards.map((_, i) => i).sort((a, b) => {
+      const aId = `${domain.phaseId}-${domain.id}-${a}`;
+      const bId = `${domain.phaseId}-${domain.id}-${b}`;
+      const aSRS = progress.srs?.[aId];
+      const bSRS = progress.srs?.[bId];
+      const score = (srs) => srs ? (new Date(srs.nextReview) <= now ? 0 : 2) : 1;
+      return score(aSRS) - score(bSRS);
+    });
+  });
   const [explanation, setExplanation] = useState('');
   const [loadingExplain, setLoadingExplain] = useState(false);
   const [sessionStats, setSessionStats] = useState({ known: 0, struggled: 0 });
+
+  // Swipe gesture state
+  const [dragX, setDragX] = useState(0);
+  const [dragging, setDragging] = useState(false);
+  const touchStartX = useRef(null);
+  const touchStartY = useRef(null);
+  const SWIPE_THRESHOLD = 75;
 
   const currentCardIdx = order[idx];
   const card = domain.cards[currentCardIdx];
@@ -2088,14 +2131,45 @@ function StudyMode({ domain, phase, setView, updateProgress, progress, toggleBoo
     }
   };
   const handleKnown = () => {
-    updateProgress(cardId, 'known');
+    const srsData = srsNextReview(progress.srs?.[cardId], true);
+    updateProgress(cardId, 'known', srsData);
     setSessionStats(s => ({ ...s, known: s.known + 1 }));
     if (!isLast) handleNext();
   };
   const handleStruggled = () => {
-    updateProgress(cardId, 'struggled');
+    const srsData = srsNextReview(progress.srs?.[cardId], false);
+    updateProgress(cardId, 'struggled', srsData);
     setSessionStats(s => ({ ...s, struggled: s.struggled + 1 }));
     if (!isLast) handleNext();
+  };
+
+  const handleTouchStart = (e) => {
+    touchStartX.current = e.touches[0].clientX;
+    touchStartY.current = e.touches[0].clientY;
+    setDragging(false);
+  };
+  const handleTouchMove = (e) => {
+    if (touchStartX.current === null) return;
+    const dx = e.touches[0].clientX - touchStartX.current;
+    const dy = e.touches[0].clientY - touchStartY.current;
+    if (Math.abs(dx) > Math.abs(dy) && Math.abs(dx) > 8) {
+      e.preventDefault();
+      setDragging(true);
+      setDragX(dx);
+    }
+  };
+  const handleTouchEnd = () => {
+    const dx = dragX;
+    setDragX(0);
+    setDragging(false);
+    touchStartX.current = null;
+    if (dragging && Math.abs(dx) > SWIPE_THRESHOLD && flipped) {
+      if (dx > 0) handleKnown();
+      else handleStruggled();
+    } else if (!dragging || Math.abs(dx) < 10) {
+      setFlipped(f => !f);
+      setExplanation('');
+    }
   };
   const shuffle = () => {
     setOrder([...order].sort(() => Math.random() - 0.5));
@@ -2150,8 +2224,25 @@ function StudyMode({ domain, phase, setView, updateProgress, progress, toggleBoo
         })}
       </div>
 
-      <div className="flex-1 flex items-center mb-8" style={{ perspective: '1500px', minHeight: '380px' }}>
-        <div onClick={() => setFlipped(!flipped)} className={`card-flip relative w-full cursor-pointer ${flipped ? 'flipped' : ''}`} style={{ minHeight: '380px' }}>
+      <div className="flex-1 flex items-center mb-8 relative" style={{ perspective: '1500px', minHeight: '380px' }}>
+        {flipped && dragX > 30 && (
+          <div className="absolute inset-0 rounded-lg flex items-center justify-center z-10 pointer-events-none" style={{ background: '#06A77D22', border: '2px solid #06A77D' }}>
+            <span className="font-display text-3xl" style={{ color: '#06A77D' }}>GOT IT ✓</span>
+          </div>
+        )}
+        {flipped && dragX < -30 && (
+          <div className="absolute inset-0 rounded-lg flex items-center justify-center z-10 pointer-events-none" style={{ background: '#E6394622', border: '2px solid #E63946' }}>
+            <span className="font-display text-3xl" style={{ color: '#E63946' }}>REVIEW ↻</span>
+          </div>
+        )}
+        <div
+          onTouchStart={handleTouchStart}
+          onTouchMove={handleTouchMove}
+          onTouchEnd={handleTouchEnd}
+          onClick={!dragging ? () => { setFlipped(f => !f); setExplanation(''); } : undefined}
+          className={`card-flip relative w-full cursor-pointer ${flipped ? 'flipped' : ''}`}
+          style={{ minHeight: '380px', transform: `translateX(${dragX * 0.15}px) rotate(${dragX * 0.02}deg)`, transition: dragging ? 'none' : undefined }}
+        >
           <div className="card-face absolute inset-0 bg-stone-900 border-2 rounded-lg p-8 flex flex-col" style={{ borderColor: domain.phaseColor + '44' }}>
             <div className="flex items-center justify-between mb-6">
               <div className="font-mono text-xs uppercase tracking-widest" style={{ color: domain.phaseColor }}>Question</div>
@@ -2223,6 +2314,177 @@ function StudyMode({ domain, phase, setView, updateProgress, progress, toggleBoo
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+// ============================================================
+// EXAM SIMULATOR
+// ============================================================
+
+function ExamSimulatorMode({ allCards, setView, updateProgress, logQuizResult, progress }) {
+  const [stage, setStage] = useState('config'); // config | exam | results
+  const [section, setSection] = useState('all');
+  const [questionCount, setQuestionCount] = useState(20);
+  const [pool, setPool] = useState([]);
+  const [idx, setIdx] = useState(0);
+  const [revealed, setRevealed] = useState(false);
+  const [timeLeft, setTimeLeft] = useState(null);
+  const [results, setResults] = useState([]);
+  const timerRef = useRef(null);
+
+  const TIME_PER_Q = section === 'sci' ? 57 : 72;
+
+  useEffect(() => {
+    if (stage !== 'exam' || timeLeft === null) return;
+    if (timeLeft <= 0) { handleAnswer(false); return; }
+    timerRef.current = setTimeout(() => setTimeLeft(t => t - 1), 1000);
+    return () => clearTimeout(timerRef.current);
+  }, [timeLeft, stage]);
+
+  const startExam = () => {
+    let cards = [...allCards];
+    if (section === 'sci') cards = cards.filter(c => SRS_SECTION_PHASES.sci.includes(c.phaseId));
+    if (section === 'practical') cards = cards.filter(c => SRS_SECTION_PHASES.practical.includes(c.phaseId));
+    const shuffled = cards.sort(() => Math.random() - 0.5).slice(0, questionCount);
+    setPool(shuffled);
+    setIdx(0);
+    setResults([]);
+    setRevealed(false);
+    setTimeLeft(TIME_PER_Q);
+    setStage('exam');
+  };
+
+  const handleAnswer = (correct) => {
+    clearTimeout(timerRef.current);
+    const card = pool[idx];
+    const newResults = [...results, { card, correct }];
+    setResults(newResults);
+    const srsData = srsNextReview(progress.srs?.[card.cardId], correct);
+    updateProgress(card.cardId, correct ? 'known' : 'struggled', srsData);
+    if (idx + 1 >= pool.length) {
+      const score = newResults.filter(r => r.correct).length;
+      logQuizResult({ mode: 'exam-sim', total: pool.length, correct: score });
+      setStage('results');
+    } else {
+      setIdx(idx + 1);
+      setRevealed(false);
+      setTimeLeft(TIME_PER_Q);
+    }
+  };
+
+  if (stage === 'config') {
+    return (
+      <div className="min-h-screen px-6 max-w-2xl mx-auto safe-top safe-bottom flex flex-col">
+        <button onClick={() => setView('home')} className="btn-back mb-4"><ArrowLeft className="w-5 h-5" /> Back</button>
+        <h2 className="font-display text-6xl text-stone-50 mb-2">EXAM SIM</h2>
+        <p className="text-stone-400 mb-8">Timed practice with real exam pacing. 70% = pass.</p>
+
+        <div className="space-y-6 flex-1">
+          <div>
+            <div className="font-mono text-xs uppercase tracking-widest text-stone-400 mb-3">Section</div>
+            <div className="grid grid-cols-3 gap-2">
+              {[['all','All Phases','67s/q'],['sci','Sci Foundations','57s/q'],['practical','Practical/Applied','72s/q']].map(([val, label, pace]) => (
+                <button key={val} onClick={() => setSection(val)} className={`p-4 rounded border text-left transition-all ${section === val ? 'bg-stone-50 text-stone-900 border-stone-50' : 'bg-stone-900 border-stone-700 text-stone-300'}`}>
+                  <div className="font-display text-lg leading-tight">{label}</div>
+                  <div className="font-mono text-xs mt-1 opacity-60">{pace}</div>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div>
+            <div className="font-mono text-xs uppercase tracking-widest text-stone-400 mb-3">Questions</div>
+            <div className="grid grid-cols-4 gap-2">
+              {[10,20,30,50].map(n => (
+                <button key={n} onClick={() => setQuestionCount(n)} className={`py-4 rounded border font-display text-2xl transition-all ${questionCount === n ? 'bg-stone-50 text-stone-900 border-stone-50' : 'bg-stone-900 border-stone-700 text-stone-300'}`}>{n}</button>
+              ))}
+            </div>
+          </div>
+
+          <div className="bg-stone-900 border border-stone-800 rounded p-4">
+            <div className="font-mono text-xs uppercase tracking-widest text-stone-500 mb-2">Session Summary</div>
+            <div className="font-display text-2xl text-stone-50">{questionCount} questions · ~{Math.round(questionCount * (section === 'sci' ? 57 : section === 'practical' ? 72 : 67) / 60)} min</div>
+            <div className="font-mono text-xs text-stone-400 mt-1">Pass threshold: {Math.ceil(questionCount * 0.7)} correct ({Math.round(questionCount * 0.7)} = 70%)</div>
+          </div>
+        </div>
+
+        <button onClick={startExam} className="w-full py-5 rounded font-display text-2xl text-stone-900 mt-6 min-h-[60px]" style={{ background: '#52B788' }}>START EXAM</button>
+      </div>
+    );
+  }
+
+  if (stage === 'results') {
+    const correct = results.filter(r => r.correct).length;
+    const pct = Math.round((correct / results.length) * 100);
+    const passed = pct >= 70;
+    return (
+      <div className="min-h-screen px-6 max-w-2xl mx-auto safe-top safe-bottom flex flex-col items-center justify-center text-center">
+        <div className="font-mono text-xs uppercase tracking-widest text-stone-500 mb-3">Exam Complete</div>
+        <div className="font-display text-9xl mb-2" style={{ color: passed ? '#06A77D' : '#E63946' }}>{pct}%</div>
+        <div className={`font-display text-3xl mb-2 ${passed ? 'text-stone-50' : 'text-stone-50'}`}>{passed ? '✓ PASS' : '✗ NOT YET'}</div>
+        <div className="font-mono text-sm text-stone-400 mb-2">{correct} of {results.length} correct</div>
+        <div className="font-mono text-xs text-stone-600 mb-10">Pass threshold: 70% ({Math.ceil(results.length * 0.7)} correct)</div>
+        {!passed && (
+          <div className="bg-stone-900 border border-stone-800 rounded p-4 mb-8 w-full text-left">
+            <div className="font-mono text-xs uppercase tracking-widest text-stone-500 mb-3">Missed Questions</div>
+            <div className="space-y-2">
+              {results.filter(r => !r.correct).slice(0, 5).map((r, i) => (
+                <div key={i} className="text-xs text-stone-400 leading-relaxed border-l-2 border-stone-700 pl-3">{r.card.q.slice(0, 80)}...</div>
+              ))}
+              {results.filter(r => !r.correct).length > 5 && <div className="font-mono text-xs text-stone-600">+{results.filter(r => !r.correct).length - 5} more</div>}
+            </div>
+          </div>
+        )}
+        <div className="flex gap-3 w-full">
+          <button onClick={() => setView('home')} className="flex-1 bg-stone-900 border border-stone-800 py-4 rounded font-mono uppercase tracking-wide text-sm min-h-[52px]">Home</button>
+          <button onClick={() => { setStage('config'); }} className="flex-1 bg-stone-50 text-stone-900 py-4 rounded font-mono uppercase tracking-wide text-sm min-h-[52px]">Retry</button>
+        </div>
+      </div>
+    );
+  }
+
+  const card = pool[idx];
+  const timerPct = (timeLeft / TIME_PER_Q) * 100;
+  const timerColor = timeLeft > 20 ? '#06A77D' : timeLeft > 10 ? '#FCBF49' : '#E63946';
+
+  return (
+    <div className="min-h-screen px-6 max-w-3xl mx-auto safe-top safe-bottom flex flex-col">
+      <div className="flex items-center justify-between mb-4">
+        <button onClick={() => { if (confirm('Exit exam?')) { clearTimeout(timerRef.current); setView('home'); }}} className="btn-back"><ArrowLeft className="w-5 h-5" /> Exit</button>
+        <div className="font-mono text-xs text-stone-500">{idx + 1} / {pool.length}</div>
+        <div className="font-display text-2xl" style={{ color: timerColor, minWidth: '3ch', textAlign: 'right' }}>{timeLeft}s</div>
+      </div>
+
+      <div className="h-1 bg-stone-800 rounded-full overflow-hidden mb-6">
+        <div className="h-full transition-all duration-1000" style={{ width: `${timerPct}%`, background: timerColor }} />
+      </div>
+
+      <div className="bg-stone-900 border-2 border-stone-800 rounded-lg p-6 flex-1 flex flex-col mb-6" style={{ minHeight: '280px' }}>
+        <div className="font-mono text-xs uppercase tracking-widest mb-4" style={{ color: card.color }}>{card.domainTitle}</div>
+        <div className="flex-1">
+          <p className="font-display text-2xl text-stone-50 leading-tight mb-4">{card.q}</p>
+          {revealed && (
+            <div className="mt-4 pt-4 border-t border-stone-700">
+              <div className="font-mono text-xs uppercase tracking-widest text-stone-500 mb-2">Answer</div>
+              <p className="text-stone-200 text-sm leading-relaxed">{card.a}</p>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {!revealed ? (
+        <button onClick={() => setRevealed(true)} className="w-full bg-stone-50 text-stone-900 py-5 rounded font-mono uppercase tracking-wide text-sm min-h-[56px]">Reveal Answer</button>
+      ) : (
+        <div className="grid grid-cols-2 gap-3">
+          <button onClick={() => handleAnswer(false)} className="bg-stone-900 border border-stone-800 py-5 rounded flex items-center justify-center gap-2 text-stone-200 min-h-[56px]">
+            <X className="w-4 h-4 text-red-500" /><span className="font-mono uppercase tracking-wide text-sm">Wrong</span>
+          </button>
+          <button onClick={() => handleAnswer(true)} className="text-stone-900 py-5 rounded flex items-center justify-center gap-2 min-h-[56px]" style={{ background: '#06A77D' }}>
+            <Check className="w-4 h-4" /><span className="font-mono uppercase tracking-wide text-sm">Correct</span>
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -2471,6 +2733,28 @@ function StatsView({ progress, allCards, setView, resetProgress }) {
     return { phase, total: cards.length, known, pct: Math.round((known / cards.length) * 100) };
   });
 
+  const weakDomains = allCards.reduce((acc, card) => {
+    const key = `${card.phaseId}__${card.domainId}`;
+    if (!acc[key]) acc[key] = { phaseId: card.phaseId, domainTitle: card.domainTitle, color: card.color, total: 0, known: 0 };
+    acc[key].total += 1;
+    if (progress.known[card.cardId]) acc[key].known += 1;
+    return acc;
+  }, {});
+  const weakList = Object.values(weakDomains)
+    .filter(d => d.total >= 5)
+    .map(d => ({ ...d, pct: Math.round((d.known / d.total) * 100) }))
+    .filter(d => d.pct < 70)
+    .sort((a, b) => a.pct - b.pct)
+    .slice(0, 8);
+
+  const srsStats = (() => {
+    const now = new Date();
+    const srs = progress.srs || {};
+    const dueToday = Object.entries(srs).filter(([, v]) => new Date(v.nextReview) <= now).length;
+    const scheduled = Object.keys(srs).length;
+    return { dueToday, scheduled };
+  })();
+
   const recentQuizzes = (progress.quizHistory || []).slice(-5).reverse();
 
   return (
@@ -2482,12 +2766,45 @@ function StatsView({ progress, allCards, setView, resetProgress }) {
       <h2 className="font-display text-6xl text-stone-50 mb-2">PROGRESS</h2>
       <p className="text-stone-400 mb-10">Your study metrics, updated as you go.</p>
 
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-10">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
         <StatCard label="Total Cards" value={totalCards} icon={BookOpen} />
         <StatCard label="Seen" value={seenCount} icon={Target} />
         <StatCard label="Mastered" value={knownCount} icon={Trophy} accent />
         <StatCard label="Need Review" value={strugglingCount} icon={RotateCcw} />
       </div>
+
+      {srsStats.scheduled > 0 && (
+        <div className="bg-stone-900 border border-stone-800 rounded p-4 mb-8 flex items-center justify-between">
+          <div>
+            <div className="font-mono text-xs uppercase tracking-widest text-stone-500 mb-1">Spaced Repetition</div>
+            <div className="font-display text-2xl text-stone-50">{srsStats.dueToday} cards due today</div>
+            <div className="font-mono text-xs text-stone-500">{srsStats.scheduled} cards scheduled total</div>
+          </div>
+          <RotateCcw className="w-6 h-6 text-stone-600" />
+        </div>
+      )}
+
+      {weakList.length > 0 && (
+        <div className="mb-10">
+          <div className="font-mono text-xs uppercase tracking-widest text-stone-400 mb-4 flex items-center gap-2">
+            <span style={{ color: '#E63946' }}>●</span> Weak Areas — Below 70%
+          </div>
+          <div className="space-y-2">
+            {weakList.map((d, i) => (
+              <div key={i} className="bg-stone-900 border rounded p-4" style={{ borderColor: '#E6394622' }}>
+                <div className="flex items-center justify-between mb-2">
+                  <div className="text-sm text-stone-200">{d.domainTitle}</div>
+                  <div className="font-display text-xl" style={{ color: d.pct < 50 ? '#E63946' : '#FCBF49' }}>{d.pct}%</div>
+                </div>
+                <div className="h-1.5 bg-stone-800 rounded-full overflow-hidden">
+                  <div className="h-full transition-all duration-700" style={{ width: `${d.pct}%`, background: d.pct < 50 ? '#E63946' : '#FCBF49' }} />
+                </div>
+                <div className="font-mono text-xs text-stone-600 mt-1">{d.known}/{d.total} mastered · need {Math.ceil(d.total * 0.7) - d.known} more to reach 70%</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       <div className="mb-10">
         <div className="font-mono text-xs uppercase tracking-widest text-stone-400 mb-4">Mastery by Phase</div>

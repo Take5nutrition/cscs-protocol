@@ -2051,9 +2051,11 @@ function StudyMode({ domain, phase, setView, updateProgress, progress, toggleBoo
 
   // Swipe gesture state
   const [dragX, setDragX] = useState(0);
-  const [dragging, setDragging] = useState(false);
   const touchStartX = useRef(null);
   const touchStartY = useRef(null);
+  const isDraggingRef = useRef(false);
+  const dragXRef = useRef(0);
+  const lastTouchEndRef = useRef(0);
   const SWIPE_THRESHOLD = 75;
 
   const currentCardIdx = order[idx];
@@ -2146,7 +2148,8 @@ function StudyMode({ domain, phase, setView, updateProgress, progress, toggleBoo
   const handleTouchStart = (e) => {
     touchStartX.current = e.touches[0].clientX;
     touchStartY.current = e.touches[0].clientY;
-    setDragging(false);
+    isDraggingRef.current = false;
+    dragXRef.current = 0;
   };
   const handleTouchMove = (e) => {
     if (touchStartX.current === null) return;
@@ -2154,22 +2157,31 @@ function StudyMode({ domain, phase, setView, updateProgress, progress, toggleBoo
     const dy = e.touches[0].clientY - touchStartY.current;
     if (Math.abs(dx) > Math.abs(dy) && Math.abs(dx) > 8) {
       e.preventDefault();
-      setDragging(true);
+      isDraggingRef.current = true;
+      dragXRef.current = dx;
       setDragX(dx);
     }
   };
-  const handleTouchEnd = () => {
-    const dx = dragX;
-    setDragX(0);
-    setDragging(false);
+  const handleTouchEnd = (e) => {
+    lastTouchEndRef.current = Date.now();
+    const dx = dragXRef.current;
+    const wasDragging = isDraggingRef.current;
+    isDraggingRef.current = false;
+    dragXRef.current = 0;
     touchStartX.current = null;
-    if (dragging && Math.abs(dx) > SWIPE_THRESHOLD && flipped) {
+    setDragX(0);
+    if (wasDragging && Math.abs(dx) > SWIPE_THRESHOLD && flipped) {
       if (dx > 0) handleKnown();
       else handleStruggled();
-    } else if (!dragging || Math.abs(dx) < 10) {
+    } else if (!wasDragging) {
       setFlipped(f => !f);
       setExplanation('');
     }
+  };
+  const handleCardClick = () => {
+    if (Date.now() - lastTouchEndRef.current < 600) return;
+    setFlipped(f => !f);
+    setExplanation('');
   };
   const shuffle = () => {
     setOrder([...order].sort(() => Math.random() - 0.5));
@@ -2239,7 +2251,7 @@ function StudyMode({ domain, phase, setView, updateProgress, progress, toggleBoo
           onTouchStart={handleTouchStart}
           onTouchMove={handleTouchMove}
           onTouchEnd={handleTouchEnd}
-          onClick={!dragging ? () => { setFlipped(f => !f); setExplanation(''); } : undefined}
+          onClick={handleCardClick}
           className={`card-flip relative w-full cursor-pointer ${flipped ? 'flipped' : ''}`}
           style={{ minHeight: '380px', transform: `translateX(${dragX * 0.15}px) rotate(${dragX * 0.02}deg)`, transition: dragging ? 'none' : undefined }}
         >
@@ -2322,13 +2334,27 @@ function StudyMode({ domain, phase, setView, updateProgress, progress, toggleBoo
 // EXAM SIMULATOR
 // ============================================================
 
+function makeChoices(card, allCards) {
+  const distractors = allCards
+    .filter(c => c.cardId !== card.cardId)
+    .sort(() => Math.random() - 0.5)
+    .slice(0, 3)
+    .map(c => c.a);
+  const choices = [
+    { text: card.a, correct: true },
+    ...distractors.map(t => ({ text: t, correct: false })),
+  ].sort(() => Math.random() - 0.5);
+  return choices;
+}
+
 function ExamSimulatorMode({ allCards, setView, updateProgress, logQuizResult, progress }) {
-  const [stage, setStage] = useState('config'); // config | exam | results
+  const [stage, setStage] = useState('config');
   const [section, setSection] = useState('all');
   const [questionCount, setQuestionCount] = useState(20);
   const [pool, setPool] = useState([]);
+  const [choices, setChoices] = useState([]);
   const [idx, setIdx] = useState(0);
-  const [revealed, setRevealed] = useState(false);
+  const [selected, setSelected] = useState(null); // index of chosen answer
   const [timeLeft, setTimeLeft] = useState(null);
   const [results, setResults] = useState([]);
   const timerRef = useRef(null);
@@ -2336,11 +2362,11 @@ function ExamSimulatorMode({ allCards, setView, updateProgress, logQuizResult, p
   const TIME_PER_Q = section === 'sci' ? 57 : 72;
 
   useEffect(() => {
-    if (stage !== 'exam' || timeLeft === null) return;
-    if (timeLeft <= 0) { handleAnswer(false); return; }
+    if (stage !== 'exam' || timeLeft === null || selected !== null) return;
+    if (timeLeft <= 0) { commitAnswer(-1); return; }
     timerRef.current = setTimeout(() => setTimeLeft(t => t - 1), 1000);
     return () => clearTimeout(timerRef.current);
-  }, [timeLeft, stage]);
+  }, [timeLeft, stage, selected]);
 
   const startExam = () => {
     let cards = [...allCards];
@@ -2348,29 +2374,50 @@ function ExamSimulatorMode({ allCards, setView, updateProgress, logQuizResult, p
     if (section === 'practical') cards = cards.filter(c => SRS_SECTION_PHASES.practical.includes(c.phaseId));
     const shuffled = cards.sort(() => Math.random() - 0.5).slice(0, questionCount);
     setPool(shuffled);
+    setChoices(makeChoices(shuffled[0], allCards));
     setIdx(0);
     setResults([]);
-    setRevealed(false);
+    setSelected(null);
     setTimeLeft(TIME_PER_Q);
     setStage('exam');
   };
 
-  const handleAnswer = (correct) => {
+  const pickAnswer = (i) => {
+    if (selected !== null) return;
     clearTimeout(timerRef.current);
+    setSelected(i);
+    const correct = choices[i].correct;
     const card = pool[idx];
-    const newResults = [...results, { card, correct }];
+    const newResults = [...results, { card, correct, chosen: choices[i].text }];
     setResults(newResults);
     const srsData = srsNextReview(progress.srs?.[card.cardId], correct);
     updateProgress(card.cardId, correct ? 'known' : 'struggled', srsData);
     if (idx + 1 >= pool.length) {
-      const score = newResults.filter(r => r.correct).length;
-      logQuizResult({ mode: 'exam-sim', total: pool.length, correct: score });
-      setStage('results');
-    } else {
-      setIdx(idx + 1);
-      setRevealed(false);
-      setTimeLeft(TIME_PER_Q);
+      logQuizResult({ mode: 'exam-sim', total: pool.length, correct: newResults.filter(r => r.correct).length });
     }
+  };
+
+  const commitAnswer = (i) => {
+    clearTimeout(timerRef.current);
+    const correct = i >= 0 ? choices[i].correct : false;
+    const card = pool[idx];
+    const newResults = [...results, { card, correct, chosen: i >= 0 ? choices[i].text : '(timed out)' }];
+    setResults(newResults);
+    const srsData = srsNextReview(progress.srs?.[card.cardId], correct);
+    updateProgress(card.cardId, correct ? 'known' : 'struggled', srsData);
+    if (idx + 1 >= pool.length) {
+      logQuizResult({ mode: 'exam-sim', total: pool.length, correct: newResults.filter(r => r.correct).length });
+      setStage('results');
+    }
+  };
+
+  const nextQuestion = () => {
+    if (idx + 1 >= pool.length) { setStage('results'); return; }
+    const nextIdx = idx + 1;
+    setIdx(nextIdx);
+    setChoices(makeChoices(pool[nextIdx], allCards));
+    setSelected(null);
+    setTimeLeft(TIME_PER_Q);
   };
 
   if (stage === 'config') {
@@ -2378,7 +2425,7 @@ function ExamSimulatorMode({ allCards, setView, updateProgress, logQuizResult, p
       <div className="min-h-screen px-6 max-w-2xl mx-auto safe-top safe-bottom flex flex-col">
         <button onClick={() => setView('home')} className="btn-back mb-4"><ArrowLeft className="w-5 h-5" /> Back</button>
         <h2 className="font-display text-6xl text-stone-50 mb-2">EXAM SIM</h2>
-        <p className="text-stone-400 mb-8">Timed practice with real exam pacing. 70% = pass.</p>
+        <p className="text-stone-400 mb-8">Multiple choice · timed · 70% to pass.</p>
 
         <div className="space-y-6 flex-1">
           <div>
@@ -2392,7 +2439,6 @@ function ExamSimulatorMode({ allCards, setView, updateProgress, logQuizResult, p
               ))}
             </div>
           </div>
-
           <div>
             <div className="font-mono text-xs uppercase tracking-widest text-stone-400 mb-3">Questions</div>
             <div className="grid grid-cols-4 gap-2">
@@ -2401,14 +2447,12 @@ function ExamSimulatorMode({ allCards, setView, updateProgress, logQuizResult, p
               ))}
             </div>
           </div>
-
           <div className="bg-stone-900 border border-stone-800 rounded p-4">
-            <div className="font-mono text-xs uppercase tracking-widest text-stone-500 mb-2">Session Summary</div>
+            <div className="font-mono text-xs uppercase tracking-widest text-stone-500 mb-2">Session</div>
             <div className="font-display text-2xl text-stone-50">{questionCount} questions · ~{Math.round(questionCount * (section === 'sci' ? 57 : section === 'practical' ? 72 : 67) / 60)} min</div>
-            <div className="font-mono text-xs text-stone-400 mt-1">Pass threshold: {Math.ceil(questionCount * 0.7)} correct ({Math.round(questionCount * 0.7)} = 70%)</div>
+            <div className="font-mono text-xs text-stone-400 mt-1">Pass: {Math.ceil(questionCount * 0.7)} correct = 70%</div>
           </div>
         </div>
-
         <button onClick={startExam} className="w-full py-5 rounded font-display text-2xl text-stone-900 mt-6 min-h-[60px]" style={{ background: '#52B788' }}>START EXAM</button>
       </div>
     );
@@ -2419,26 +2463,25 @@ function ExamSimulatorMode({ allCards, setView, updateProgress, logQuizResult, p
     const pct = Math.round((correct / results.length) * 100);
     const passed = pct >= 70;
     return (
-      <div className="min-h-screen px-6 max-w-2xl mx-auto safe-top safe-bottom flex flex-col items-center justify-center text-center">
-        <div className="font-mono text-xs uppercase tracking-widest text-stone-500 mb-3">Exam Complete</div>
-        <div className="font-display text-9xl mb-2" style={{ color: passed ? '#06A77D' : '#E63946' }}>{pct}%</div>
-        <div className={`font-display text-3xl mb-2 ${passed ? 'text-stone-50' : 'text-stone-50'}`}>{passed ? '✓ PASS' : '✗ NOT YET'}</div>
-        <div className="font-mono text-sm text-stone-400 mb-2">{correct} of {results.length} correct</div>
-        <div className="font-mono text-xs text-stone-600 mb-10">Pass threshold: 70% ({Math.ceil(results.length * 0.7)} correct)</div>
-        {!passed && (
-          <div className="bg-stone-900 border border-stone-800 rounded p-4 mb-8 w-full text-left">
-            <div className="font-mono text-xs uppercase tracking-widest text-stone-500 mb-3">Missed Questions</div>
-            <div className="space-y-2">
-              {results.filter(r => !r.correct).slice(0, 5).map((r, i) => (
-                <div key={i} className="text-xs text-stone-400 leading-relaxed border-l-2 border-stone-700 pl-3">{r.card.q.slice(0, 80)}...</div>
-              ))}
-              {results.filter(r => !r.correct).length > 5 && <div className="font-mono text-xs text-stone-600">+{results.filter(r => !r.correct).length - 5} more</div>}
-            </div>
+      <div className="min-h-screen px-6 max-w-2xl mx-auto safe-top safe-bottom flex flex-col">
+        <div className="flex-1 flex flex-col items-center justify-center text-center">
+          <div className="font-mono text-xs uppercase tracking-widest text-stone-500 mb-3">Exam Complete</div>
+          <div className="font-display mb-2" style={{ fontSize: '6rem', color: passed ? '#06A77D' : '#E63946', lineHeight: 1 }}>{pct}%</div>
+          <div className="font-display text-3xl text-stone-50 mb-2">{passed ? '✓ PASS' : '✗ NOT YET'}</div>
+          <div className="font-mono text-sm text-stone-400 mb-1">{correct} of {results.length} correct</div>
+          <div className="font-mono text-xs text-stone-600 mb-8">Pass threshold: 70%</div>
+          <div className="w-full space-y-2 text-left">
+            {results.filter(r => !r.correct).slice(0, 6).map((r, i) => (
+              <div key={i} className="bg-stone-900 border border-stone-800 rounded p-3">
+                <div className="text-xs text-stone-400 mb-1">{r.card.q.slice(0, 90)}{r.card.q.length > 90 ? '…' : ''}</div>
+                <div className="font-mono text-xs" style={{ color: '#06A77D' }}>✓ {r.card.a.slice(0, 70)}{r.card.a.length > 70 ? '…' : ''}</div>
+              </div>
+            ))}
           </div>
-        )}
-        <div className="flex gap-3 w-full">
+        </div>
+        <div className="flex gap-3 mt-6">
           <button onClick={() => setView('home')} className="flex-1 bg-stone-900 border border-stone-800 py-4 rounded font-mono uppercase tracking-wide text-sm min-h-[52px]">Home</button>
-          <button onClick={() => { setStage('config'); }} className="flex-1 bg-stone-50 text-stone-900 py-4 rounded font-mono uppercase tracking-wide text-sm min-h-[52px]">Retry</button>
+          <button onClick={() => setStage('config')} className="flex-1 bg-stone-50 text-stone-900 py-4 rounded font-mono uppercase tracking-wide text-sm min-h-[52px]">Retry</button>
         </div>
       </div>
     );
@@ -2450,40 +2493,48 @@ function ExamSimulatorMode({ allCards, setView, updateProgress, logQuizResult, p
 
   return (
     <div className="min-h-screen px-6 max-w-3xl mx-auto safe-top safe-bottom flex flex-col">
-      <div className="flex items-center justify-between mb-4">
+      <div className="flex items-center justify-between mb-3">
         <button onClick={() => { if (confirm('Exit exam?')) { clearTimeout(timerRef.current); setView('home'); }}} className="btn-back"><ArrowLeft className="w-5 h-5" /> Exit</button>
         <div className="font-mono text-xs text-stone-500">{idx + 1} / {pool.length}</div>
-        <div className="font-display text-2xl" style={{ color: timerColor, minWidth: '3ch', textAlign: 'right' }}>{timeLeft}s</div>
+        <div className="font-display text-2xl" style={{ color: selected !== null ? '#888' : timerColor, minWidth: '3ch', textAlign: 'right' }}>{selected !== null ? '—' : `${timeLeft}s`}</div>
       </div>
 
-      <div className="h-1 bg-stone-800 rounded-full overflow-hidden mb-6">
-        <div className="h-full transition-all duration-1000" style={{ width: `${timerPct}%`, background: timerColor }} />
+      <div className="h-1 bg-stone-800 rounded-full overflow-hidden mb-5">
+        <div className="h-full transition-all duration-1000" style={{ width: `${selected !== null ? 100 : timerPct}%`, background: selected !== null ? '#444' : timerColor }} />
       </div>
 
-      <div className="bg-stone-900 border-2 border-stone-800 rounded-lg p-6 flex-1 flex flex-col mb-6" style={{ minHeight: '280px' }}>
-        <div className="font-mono text-xs uppercase tracking-widest mb-4" style={{ color: card.color }}>{card.domainTitle}</div>
-        <div className="flex-1">
-          <p className="font-display text-2xl text-stone-50 leading-tight mb-4">{card.q}</p>
-          {revealed && (
-            <div className="mt-4 pt-4 border-t border-stone-700">
-              <div className="font-mono text-xs uppercase tracking-widest text-stone-500 mb-2">Answer</div>
-              <p className="text-stone-200 text-sm leading-relaxed">{card.a}</p>
-            </div>
-          )}
-        </div>
+      <div className="bg-stone-900 border border-stone-800 rounded-lg p-5 mb-4">
+        <div className="font-mono text-xs uppercase tracking-widest mb-3" style={{ color: card.color }}>{card.domainTitle}</div>
+        <p className="font-display text-xl text-stone-50 leading-snug">{card.q}</p>
       </div>
 
-      {!revealed ? (
-        <button onClick={() => setRevealed(true)} className="w-full bg-stone-50 text-stone-900 py-5 rounded font-mono uppercase tracking-wide text-sm min-h-[56px]">Reveal Answer</button>
-      ) : (
-        <div className="grid grid-cols-2 gap-3">
-          <button onClick={() => handleAnswer(false)} className="bg-stone-900 border border-stone-800 py-5 rounded flex items-center justify-center gap-2 text-stone-200 min-h-[56px]">
-            <X className="w-4 h-4 text-red-500" /><span className="font-mono uppercase tracking-wide text-sm">Wrong</span>
-          </button>
-          <button onClick={() => handleAnswer(true)} className="text-stone-900 py-5 rounded flex items-center justify-center gap-2 min-h-[56px]" style={{ background: '#06A77D' }}>
-            <Check className="w-4 h-4" /><span className="font-mono uppercase tracking-wide text-sm">Correct</span>
-          </button>
-        </div>
+      <div className="space-y-2 flex-1">
+        {choices.map((choice, i) => {
+          let bg = 'bg-stone-900 border-stone-800';
+          let textColor = 'text-stone-200';
+          if (selected !== null) {
+            if (choice.correct) { bg = 'border-green-500'; textColor = 'text-green-400'; }
+            else if (i === selected && !choice.correct) { bg = 'border-red-500'; textColor = 'text-red-400'; }
+            else { bg = 'bg-stone-900 border-stone-800'; textColor = 'text-stone-600'; }
+          }
+          return (
+            <button
+              key={i}
+              onClick={() => pickAnswer(i)}
+              disabled={selected !== null}
+              className={`w-full border rounded-lg p-4 text-left transition-all ${bg} ${textColor}`}
+            >
+              <span className="font-mono text-xs mr-2 opacity-60">{String.fromCharCode(65 + i)}.</span>
+              <span className="text-sm leading-relaxed">{choice.text}</span>
+            </button>
+          );
+        })}
+      </div>
+
+      {selected !== null && (
+        <button onClick={nextQuestion} className="w-full mt-4 py-4 rounded font-mono uppercase tracking-wide text-sm text-stone-900 min-h-[52px]" style={{ background: '#52B788' }}>
+          {idx + 1 >= pool.length ? 'See Results' : 'Next Question →'}
+        </button>
       )}
     </div>
   );
